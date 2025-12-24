@@ -106,38 +106,16 @@ def to_date(x):
 # -----------------------------
 # Parse template (robust)
 # -----------------------------
-def read_template(uploaded_bytes: bytes):
-    xls = pd.ExcelFile(io.BytesIO(uploaded_bytes))
+params_sheet = find_sheet(xls, ["Parameters", "Params"])
 
-    staff_sheet = find_sheet(xls, ["Staff", "Skills", "People"])
-    hours_sheet = find_sheet(xls, ["WorkingHours", "Hours", "Availability"])
-    hols_sheet = find_sheet(xls, ["Holidays", "Leave", "Absence"])
-    params_sheet = find_sheet(xls, ["Parameters", "Params", "Rules", "Config"])
-
-    if not staff_sheet:
-        raise ValueError(f"Could not find Staff/Skills sheet. Found: {xls.sheet_names}")
-    if not hours_sheet:
-        raise ValueError(f"Could not find WorkingHours/Hours sheet. Found: {xls.sheet_names}")
-    if not params_sheet:
-        raise ValueError(f"Could not find Parameters/Params sheet. Found: {xls.sheet_names}")
-
-    staff_df = pd.read_excel(xls, sheet_name=staff_sheet)
-    hours_df = pd.read_excel(xls, sheet_name=hours_sheet)
-    hols_df = pd.read_excel(xls, sheet_name=hols_sheet) if hols_sheet else pd.DataFrame()
+if not params_sheet:
+    # Parameters sheet is OPTIONAL – use defaults
+    params = {}
+    found_params = False
+else:
     params_df = pd.read_excel(xls, sheet_name=params_sheet)
-
-    # --- staff cols ---
-    name_c = pick_col(staff_df, ["Name", "StaffName"])
-    home_c = pick_col(staff_df, ["HomeSite", "Site", "BaseSite"], required=False)
-
-    staff_df = staff_df.copy()
-    staff_df["Name"] = staff_df[name_c].astype(str).str.strip()
-    staff_df["HomeSite"] = staff_df[home_c].astype(str).str.strip().fillna("") if home_c else ""
-
-    # skills: any Y/N columns become skill flags
-    skill_cols = [c for c in staff_df.columns if normalize(c) not in [normalize(name_c), normalize(home_c or "")]]
-    # keep only meaningful skill columns (avoid blanks)
-    skill_cols = [c for c in skill_cols if staff_df[c].notna().any()]
+    params = dict(zip(params_df["Rule"], params_df["Value"]))
+    found_params = True
 
     def yn(v):
         if pd.isna(v): return False
