@@ -573,36 +573,40 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
             fill_block(pick, d, idx)
 
     def enforce_role_need(role, need, d, idx):
-        t = slots[idx]
-        current = has_role_at(role, d, t)
-        while len(current) < need:
-            # decide whether cross-site is allowed
-            allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
-            # candidate pool
-            cands = []
-            for name in staff_by_name.keys():
-                if candidate_ok(name, role, d, t, allow_cross=allow_cross):
-                    # site-sticky: prefer same site blocks
-                    prev_block = block.get((d, name))
-                    penalty = 0
-                    if prev_block:
-                        # if they are blocked to other role, they won't be candidate_ok anyway
-                        penalty = 0
-                    # deprioritise if they've already done lots of this role today
-                    used_mins = role_minutes.get((d, name, role), 0)
-                    penalty += used_mins / 60.0
-                    penalty -= 0.75 * (skill_weight(sr, role) - 3)
-                    cands.append((penalty, name))
-            if not cands:
-                if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
-                    gaps.append((d, t, role, "No suitable staff available"))
-                break
-            cands.sort(key=lambda x: x[0])
-            pick = cands[0][1]
-            if (d, pick) not in block:
-                start_block(pick, role, d, idx)
-            fill_block(pick, d, idx)
-            current = has_role_at(role, d, t)
+    t = slots[idx]
+    current = staff_assigned_to(role, d, t)
+
+    while len(current) < need:
+        allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
+
+        cands = []
+        for name, sr in staff_by_name.items():
+            if not candidate_ok(name, role, d, t, allow_cross=allow_cross):
+                continue
+
+            used_mins = role_minutes.get((d, name, role), 0)
+
+            # v9a primary behaviour (unchanged)
+            primary = used_mins / 60.0
+
+            # v10b tie-break only (neutral = 0)
+            tie_break = -(skill_weight(sr, role) - 3)
+
+            cands.append(((primary, tie_break), name))
+
+        if not cands:
+            if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
+                gaps.append((d, t, role, "No suitable staff available"))
+            break
+
+        cands.sort(key=lambda x: x[0])
+        pick = cands[0][1]
+
+        if (d, pick) not in active:
+            start_block(pick, role, d, idx)
+
+        apply_block_if_active(pick, d, idx)
+        current = staff_assigned_to(role, d, t)
 
     # main loop: per day, per slot
     for d in dates:
