@@ -582,19 +582,17 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
             # candidate pool
             cands = []
             for name in staff_by_name.keys():
-                if candidate_ok(name, role, d, t, allow_cross=allow_cross):
-                    # site-sticky: prefer same site blocks
-                    prev_block = block.get((d, name))
-                    penalty = 0
-                    if prev_block:
-                        # if they are blocked to other role, they won't be candidate_ok anyway
-                        penalty = 0
-                    # deprioritise if they've already done lots of this role today
-                    used_mins = role_minutes.get((d, name, role), 0)
-                    penalty += used_mins / 60.0
-                    # Prefer higher-weight staff for the role
-                    penalty -= 0.75 * (skill_weight(sr, role) - 3)
-                    cands.append((penalty, name))
+    sr = staff_by_name[name]  # ✅ FIX: define sr
+
+    if candidate_ok(name, role, d, t, allow_cross=allow_cross):
+        used_mins = role_minutes.get((d, name, role), 0)
+
+        penalty = used_mins / 60.0
+
+        # Prefer higher-weight staff for this role
+        penalty -= 0.75 * (skill_weight(sr, role) - 3)
+
+        cands.append((penalty, name))
             if not cands:
                 if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
                     gaps.append((d, t, role, "No suitable staff available"))
