@@ -582,7 +582,7 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
             # candidate pool
             cands = []
             for name in staff_by_name.keys():
-    sr = staff_by_name[name]  # ✅ FIX: define sr
+            sr = staff_by_name[name]  # ✅ FIX: define sr
 
     if candidate_ok(name, role, d, t, allow_cross=allow_cross):
         used_mins = role_minutes.get((d, name, role), 0)
