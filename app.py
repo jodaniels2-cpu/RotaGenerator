@@ -853,10 +853,10 @@ def build_workbook(staff_df, hours_df, hols, start_monday: date, weeks: int):
 # =========================================================
 # Streamlit UI
 # =========================================================
-st.set_page_config(page_title="Rota Generator v9 (block engine)", layout="wide")
+st.set_page_config(page_title="Rota Generator Modality Lewiham PSAs", layout="wide")
 require_password()
 
-st.title("Rota Generator v9 — Block-based engine")
+st.title("Rota Generator -Modality Lewisham PSAs")
 
 uploaded = st.file_uploader("Upload rota template (.xlsx)", type=["xlsx"])
 
