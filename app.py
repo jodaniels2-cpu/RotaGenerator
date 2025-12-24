@@ -581,18 +581,18 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
             allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
             # candidate pool
             cands = []
-            for name in staff_by_name.keys():
-            sr = staff_by_name[name]  # ✅ FIX: define sr
+        for name in staff_by_name.keys():
+            sr = staff_by_name[name]  # ✅ define sr INSIDE the loop
 
-    if candidate_ok(name, role, d, t, allow_cross=allow_cross):
-        used_mins = role_minutes.get((d, name, role), 0)
+           if candidate_ok(name, role, d, t, allow_cross=allow_cross):
+              used_mins = role_minutes.get((d, name, role), 0)
 
-        penalty = used_mins / 60.0
+              penalty = used_mins / 60.0
 
-        # Prefer higher-weight staff for this role
-        penalty -= 0.75 * (skill_weight(sr, role) - 3)
+             # Prefer higher-weight staff for this role
+             penalty -= 0.75 * (skill_weight(sr, role) - 3)
 
-        cands.append((penalty, name))
+             cands.append((penalty, name))
             if not cands:
                 if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
                     gaps.append((d, t, role, "No suitable staff available"))
