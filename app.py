@@ -663,7 +663,9 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
                         if role != "Email_Box" and used >= 360:
                             continue
                         wgt = skill_weight(sr, role)
-                        score = used - (wgt - 3) * 30
+                        primary = used
+                        tie = -(wgt - 3)
+                        score = (primary, tie)
                         if best is None or score < best[0]:
                             best = (score, role)
                     if best:
