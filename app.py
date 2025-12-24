@@ -580,9 +580,10 @@ def rota_generate_week(staff_df, hours_df, hols, week_start: date):
             # decide whether cross-site is allowed
             allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
             # candidate pool
-            cands = []
+cands = []
+
 for name in staff_by_name.keys():
-    sr = staff_by_name[name]  # ✅ FIX: define staff record
+    sr = staff_by_name[name]
 
     if candidate_ok(name, role, d, t, allow_cross=allow_cross):
         used_mins = role_minutes.get((d, name, role), 0)
@@ -593,9 +594,17 @@ for name in staff_by_name.keys():
         penalty -= 0.75 * (skill_weight(sr, role) - 3)
 
         cands.append((penalty, name))
-          if not cands:
-                if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
-                    gaps.append((d, t, role, "No suitable staff available"))
+
+# ⬇️ THIS MUST BE OUTSIDE THE FOR LOOP
+if not cands:
+    if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
+        gaps.append((d, t, role, "No suitable staff available"))
+    return
+
+# pick best candidate
+cands.sort(key=lambda x: x[0])
+pick = cands[0][1]
+
                 break
             cands.sort(key=lambda x: x[0])
             pick = cands[0][1]
