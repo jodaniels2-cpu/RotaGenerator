@@ -1,46 +1,54 @@
 import io
 import re
 from datetime import datetime, date, time, timedelta
+
 import pandas as pd
 import streamlit as st
-
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
 
+# =========================================================
+# Rota Generator v10 — block-based engine
+# =========================================================
+# What’s new vs v10/v10:
+# - A true block scheduler: assigns tasks in 2h minimum blocks (unless end-of-shift/break).
+# - Max block 3h for all tasks except Email (Email can run longer).
+# - Front Desk is enforced as exactly 1 per site per slot.
+# - Cross-site is only used when NO home-site staff can cover that role at that time (never for Front Desk; Bookings stays SLGP-only).
+# - Timeline cells explicitly show Holiday / Sick / Bank Holiday / Not working and are color-coded.
+#
+# Template expectations (as you’ve been using):
+# Staff sheet: Name, HomeSite, CanFrontDesk, CanTriage, CanEmail, CanPhones, CanBookings, CanEMIS, CanDocman_PSA, CanDocman_AWAIT, (optional) IsCarolChurch(Y/N)
+# WorkingHours sheet: Name, MonStart/MonEnd ... FriStart/FriEnd
+# Holidays sheet (optional): Name, Start, End, Notes (Notes => default Holiday unless contains "sick"/"sickness" or "bank")
+#
+# Upload this file as app.py on Streamlit Cloud.
 
-# -----------------------------
-# Password protection (Streamlit Secrets)
-# -----------------------------
+# ---------------- Password (Streamlit secrets TOML) ----------------
 def require_password():
-    # Set in Streamlit Cloud -> App -> Settings -> Secrets:
-    # APP_PASSWORD="yourpassword"
-    pw = st.secrets.get("APP_PASSWORD", None)
+    """
+    In Streamlit Secrets (TOML):
+      APP_PASSWORD = "your-strong-password"
+    """
+    pw = st.secrets.get("APP_PASSWORD")
     if not pw:
-        st.warning("Password is not configured. Add APP_PASSWORD in Streamlit Secrets to enable protection.")
+        st.warning("APP_PASSWORD not set in Streamlit Secrets. App is not password-protected.")
         return True
-
-    if "authed" not in st.session_state:
-        st.session_state.authed = False
-
-    if st.session_state.authed:
+    if st.session_state.get("authed"):
         return True
-
     with st.form("login"):
         entered = st.text_input("Password", type="password")
         ok = st.form_submit_button("Log in")
+        if ok and entered == pw:
+            st.session_state.authed = True
+            st.success("Logged in.")
+            return True
         if ok:
-            if entered == pw:
-                st.session_state.authed = True
-                st.success("Logged in.")
-                return True
             st.error("Incorrect password.")
     st.stop()
 
-
-# -----------------------------
-# Helpers: robust sheet + column detection
-# -----------------------------
+# ---------------- Helpers ----------------
 def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
@@ -50,7 +58,6 @@ def find_sheet(xls: pd.ExcelFile, candidates):
         key = normalize(c)
         if key in names:
             return names[key]
-    # fuzzy contains
     for n in xls.sheet_names:
         nn = normalize(n)
         for c in candidates:
@@ -64,14 +71,14 @@ def pick_col(df: pd.DataFrame, candidates, required=True):
         key = normalize(cand)
         if key in cols:
             return cols[key]
-    # fuzzy contains
+    # substring fallback
     for c in df.columns:
         nc = normalize(c)
         for cand in candidates:
             if normalize(cand) in nc:
                 return c
     if required:
-        raise KeyError(f"Could not find required column among: {candidates}. Available: {list(df.columns)}")
+        raise KeyError(f"Missing required column among {candidates}. Available: {list(df.columns)}")
     return None
 
 def to_time(x):
@@ -82,16 +89,10 @@ def to_time(x):
     if isinstance(x, datetime):
         return x.time()
     if isinstance(x, (float, int)):
-        # Excel time as fraction of day
+        # excel time fraction of day
         seconds = int(round(float(x) * 86400))
         return (datetime(2000, 1, 1) + timedelta(seconds=seconds)).time()
-    s = str(x).strip()
-    for fmt in ("%H:%M", "%H.%M", "%I:%M%p", "%I:%M %p"):
-        try:
-            return datetime.strptime(s, fmt).time()
-        except ValueError:
-            pass
-    raise ValueError(f"Unrecognized time format: {x}")
+    return pd.to_datetime(str(x)).time()
 
 def to_date(x):
     if pd.isna(x) or x == "":
@@ -102,115 +103,600 @@ def to_date(x):
         return x
     return pd.to_datetime(x).date()
 
+def dt_of(d: date, t: time) -> datetime:
+    return datetime(d.year, d.month, d.day, t.hour, t.minute)
 
-# -----------------------------
-# Parse template (robust)
-# -----------------------------
+def add_minutes(t: time, mins: int) -> time:
+    return (datetime(2000, 1, 1, t.hour, t.minute) + timedelta(minutes=mins)).time()
+
+def t_in_range(t: time, a: time, b: time) -> bool:
+    return (t >= a) and (t < b)
+
+def ensure_monday(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+# ---------------- Read template ----------------
 def read_template(uploaded_bytes: bytes):
     xls = pd.ExcelFile(io.BytesIO(uploaded_bytes))
-
     staff_sheet = find_sheet(xls, ["Staff", "Skills", "People"])
     hours_sheet = find_sheet(xls, ["WorkingHours", "Hours", "Availability"])
     hols_sheet = find_sheet(xls, ["Holidays", "Leave", "Absence"])
-    params_sheet = find_sheet(xls, ["Parameters", "Params", "Rules", "Config"])
 
     if not staff_sheet:
-        raise ValueError(f"Could not find Staff/Skills sheet. Found: {xls.sheet_names}")
+        raise ValueError(f"Could not find Staff sheet. Found: {xls.sheet_names}")
     if not hours_sheet:
-        raise ValueError(f"Could not find WorkingHours/Hours sheet. Found: {xls.sheet_names}")
-    if not params_sheet:
-        raise ValueError(f"Could not find Parameters/Params sheet. Found: {xls.sheet_names}")
+        raise ValueError(f"Could not find WorkingHours sheet. Found: {xls.sheet_names}")
 
     staff_df = pd.read_excel(xls, sheet_name=staff_sheet)
     hours_df = pd.read_excel(xls, sheet_name=hours_sheet)
     hols_df = pd.read_excel(xls, sheet_name=hols_sheet) if hols_sheet else pd.DataFrame()
-    params_df = pd.read_excel(xls, sheet_name=params_sheet)
 
-    # --- staff cols ---
     name_c = pick_col(staff_df, ["Name", "StaffName"])
     home_c = pick_col(staff_df, ["HomeSite", "Site", "BaseSite"], required=False)
 
     staff_df = staff_df.copy()
     staff_df["Name"] = staff_df[name_c].astype(str).str.strip()
-    staff_df["HomeSite"] = staff_df[home_c].astype(str).str.strip().fillna("") if home_c else ""
-
-    # skills: any Y/N columns become skill flags
-    skill_cols = [c for c in staff_df.columns if normalize(c) not in [normalize(name_c), normalize(home_c or "")]]
-    # keep only meaningful skill columns (avoid blanks)
-    skill_cols = [c for c in skill_cols if staff_df[c].notna().any()]
+    staff_df["HomeSite"] = staff_df[home_c].astype(str).str.strip().str.upper() if home_c else ""
 
     def yn(v):
         if pd.isna(v): return False
         s = str(v).strip().lower()
         return s in ["y", "yes", "true", "1"]
 
-    for c in skill_cols:
-        staff_df[c] = staff_df[c].apply(yn)
-
-    # detect Carol Church column (optional)
-    carol_c = None
     for c in staff_df.columns:
-        if normalize(c) in ["iscarolchurch", "carolchurch", "carol"]:
-            carol_c = c
-            break
+        if normalize(c).startswith("can") or normalize(c) in ["iscarolchurchyn", "iscarolchurch"]:
+            staff_df[c] = staff_df[c].apply(yn)
+
+    carol_c = pick_col(staff_df, ["IsCarolChurch(Y/N)", "IsCarolChurch", "Carol"], required=False)
     if carol_c:
         staff_df["IsCarolChurch"] = staff_df[carol_c].apply(bool)
     else:
         staff_df["IsCarolChurch"] = staff_df["Name"].str.lower().eq("carol church")
 
-    # --- working hours ---
-    hn = normalize
     hours_df = hours_df.copy()
     hours_name_c = pick_col(hours_df, ["Name", "StaffName"])
     hours_df["Name"] = hours_df[hours_name_c].astype(str).str.strip()
 
-    # day columns: MonStart MonEnd ...
-    days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-    for d in days:
+    for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]:
         sc = pick_col(hours_df, [f"{d}Start", f"{d} Start", f"{d}_Start"], required=False)
         ec = pick_col(hours_df, [f"{d}End", f"{d} End", f"{d}_End"], required=False)
         hours_df[f"{d}Start"] = hours_df[sc].apply(to_time) if sc else None
         hours_df[f"{d}End"] = hours_df[ec].apply(to_time) if ec else None
 
-    # --- holidays ---
+    # Holidays with Notes => default Holiday unless contains "sickness/sick" or "bank"
     hols = []
     if not hols_df.empty:
-        hname = pick_col(hols_df, ["Name", "StaffName"], required=False)
-        hs = pick_col(hols_df, ["StartDate", "Start"], required=False)
-        he = pick_col(hols_df, ["EndDate", "End"], required=False)
-        if hname and hs and he:
-            for _, r in hols_df.iterrows():
-                hols.append((str(r[hname]).strip(), to_date(r[hs]), to_date(r[he])))
+        hn = pick_col(hols_df, ["Name", "StaffName"], required=False) or hols_df.columns[0]
+        hs = pick_col(hols_df, ["StartDate", "Start"], required=False) or hols_df.columns[1]
+        he = pick_col(hols_df, ["EndDate", "End"], required=False) or hols_df.columns[2]
+        notes_c = pick_col(hols_df, ["Notes", "Note", "Reason"], required=False)
+        for _, r in hols_df.iterrows():
+            nm = str(r[hn]).strip()
+            sd = to_date(r[hs])
+            ed = to_date(r[he])
+            note = "" if (not notes_c or pd.isna(r[notes_c])) else str(r[notes_c]).strip().lower()
+            kind = "Holiday"
+            if "sick" in note or "sickness" in note:
+                kind = "Sick"
+            elif "bank" in note:
+                kind = "Bank Holiday"
+            hols.append((nm, sd, ed, kind))
 
-    # --- parameters ---
-    # accept many formats: Rule/Value, Parameter/Value, Key/Value
-    rule_c = pick_col(params_df, ["Rule", "Parameter", "Key", "Setting"], required=False)
-    val_c = pick_col(params_df, ["Value", "Val"], required=False)
-    params = {}
-    if rule_c and val_c:
-        for _, r in params_df.iterrows():
-            k = str(r[rule_c]).strip()
-            if k and k.lower() != "nan":
-                params[k] = r[val_c]
-    else:
-        # fallback: first two columns
-        if params_df.shape[1] >= 2:
-            c1, c2 = params_df.columns[:2]
-            for _, r in params_df.iterrows():
-                k = str(r[c1]).strip()
-                if k and k.lower() != "nan":
-                    params[k] = r[c2]
+    return staff_df, hours_df, hols
 
-    return staff_df, hours_df, hols, params, xls.sheet_names
+# ---------------- Business rules ----------------
+DAY_START = time(8, 0)
+DAY_END = time(18, 30)
+SLOT_MIN = 30
+
+# User requirement: min 2 hours, max 3 hours (except email)
+MIN_BLOCK_SLOTS = 4  # 2h
+MAX_BLOCK_SLOTS = 6  # 3h
+
+# Breaks: start times fixed to 12:00–14:00 window, pick nearest midpoint
+BREAK_WINDOW = (time(12, 0), time(14, 0))
+BREAK_THRESHOLD_HOURS = 6.0
+
+def timeslots():
+    cur = datetime(2000, 1, 1, DAY_START.hour, DAY_START.minute)
+    end = datetime(2000, 1, 1, DAY_END.hour, DAY_END.minute)
+    out = []
+    while cur < end:
+        out.append(cur.time())
+        cur += timedelta(minutes=SLOT_MIN)
+    return out
+
+MANDATORY_RULES = [
+    ("FrontDesk_SLGP", DAY_START, DAY_END, 1),
+    ("FrontDesk_JEN",  DAY_START, DAY_END, 1),
+    ("FrontDesk_BGS",  DAY_START, DAY_END, 1),
+
+    ("Triage_Admin_SLGP", DAY_START, time(16, 0), 1),
+    ("Triage_Admin_JEN",  DAY_START, time(16, 0), 1),
+
+    ("Email_Box", DAY_START, DAY_END, 1),
+
+    ("Phones", DAY_START, DAY_END, 2),
+    ("Bookings", DAY_START, DAY_END, 3),
+]
+
+def awaiting_site_for_day(d: date) -> str:
+    # Mon/Fri SLGP, Tue/Thu JEN, Wed BGS
+    wd = d.weekday()
+    if wd in (0, 4):
+        return "SLGP"
+    if wd in (1, 3):
+        return "JEN"
+    return "BGS"
+
+def awaiting_required(d: date, t: time) -> bool:
+    return t_in_range(t, time(10, 0), time(16, 0))
+
+def awaiting_optional(d: date, t: time) -> bool:
+    return t_in_range(t, time(16, 0), DAY_END)
+
+def filler_order_for_day(d: date):
+    # Mon/Fri: phones priority
+    if d.weekday() in (0, 4):
+        return ["Phones", "Bookings", "Awaiting_PSA_Admin", "Emis_Tasks", "Docman_Tasks"]
+    return ["Phones", "Bookings", "Emis_Tasks", "Docman_Tasks", "Awaiting_PSA_Admin"]
+
+# ---------------- Skill weighting (optional columns) ----------------
+# Optional columns on Staff sheet (0–5): PhonesWeight, BookingsWeight, EmisWeight, DocmanWeight,
+# AwaitingWeight, EmailWeight, TriageWeight, FrontDeskWeight. Missing/blank => neutral 3.
+def skill_weight(sr, role: str) -> int:
+    mapping = {
+        "Phones": "PhonesWeight",
+        "Bookings": "BookingsWeight",
+        "Emis_Tasks": "EmisWeight",
+        "Docman_Tasks": "DocmanWeight",
+        "Awaiting_PSA_Admin": "AwaitingWeight",
+        "Email_Box": "EmailWeight",
+        "Triage_Admin_SLGP": "TriageWeight",
+        "Triage_Admin_JEN": "TriageWeight",
+        "FrontDesk_SLGP": "FrontDeskWeight",
+        "FrontDesk_JEN": "FrontDeskWeight",
+        "FrontDesk_BGS": "FrontDeskWeight",
+    }
+    col = mapping.get(role)
+    if not col:
+        return 3
+    try:
+        v = sr.get(col, 3)
+        if pd.isna(v):
+            return 3
+        v = int(float(v))
+        return max(0, min(5, v))
+    except Exception:
+        return 3
 
 
-# -----------------------------
-# Core rota model
-# -----------------------------
-SITES = ["SLGP", "JEN", "BGS"]
+# ---------------- Skills mapping ----------------
+def can(sr, col: str) -> bool:
+    return bool(sr.get(col, False))
 
-# Role keys used in output + color map
+def skill_allowed(sr, role: str) -> bool:
+    if role.startswith("FrontDesk"):
+        return can(sr, "CanFrontDesk")
+    if role.startswith("Triage_Admin"):
+        return can(sr, "CanTriage")
+    if role == "Email_Box":
+        return can(sr, "CanEmail")
+    if role == "Phones":
+        return can(sr, "CanPhones")
+    if role == "Bookings":
+        return can(sr, "CanBookings")
+    if role == "Emis_Tasks":
+        return can(sr, "CanEMIS")
+    if role == "Docman_Tasks":
+        return can(sr, "CanDocman_PSA") or can(sr, "CanDocman_AWAIT")
+    if role == "Awaiting_PSA_Admin":
+        return can(sr, "CanDocman_PSA") or can(sr, "CanDocman_AWAIT")
+    if role == "Unassigned":
+        return True
+    return False
+
+def role_site(role: str, d: date) -> str:
+    if role.endswith("_SLGP"):
+        return "SLGP"
+    if role.endswith("_JEN"):
+        return "JEN"
+    if role.endswith("_BGS"):
+        return "BGS"
+    if role == "Bookings":
+        return "SLGP"
+    if role == "Awaiting_PSA_Admin":
+        return awaiting_site_for_day(d)
+    return ""  # shared
+
+def is_frontdesk(role: str) -> bool:
+    return role.startswith("FrontDesk_")
+
+def site_allowed(sr, role: str, d: date, allow_cross: bool) -> bool:
+    home = str(sr.get("HomeSite", "")).strip().upper()
+    if is_frontdesk(role):
+        return home == role_site(role, d)
+    if role == "Bookings":
+        return home == "SLGP"
+    if role.startswith("Triage_Admin"):
+        target = role_site(role, d)
+        return (home == target) or allow_cross
+    if role == "Awaiting_PSA_Admin":
+        target = awaiting_site_for_day(d)
+        return (home == target) or allow_cross
+    if role in ["Email_Box", "Phones", "Emis_Tasks", "Docman_Tasks"]:
+        if home in ["JEN", "BGS"]:
+            return True
+        return allow_cross
+    return True
+
+# ---------------- Holidays / working hours ----------------
+def holiday_kind(name: str, d: date, hols):
+    for n, s, e, k in hols:
+        if n.strip().lower() == name.strip().lower() and s and e and s <= d <= e:
+            return k
+    return None
+
+def build_maps(staff_df, hours_df):
+    staff_by_name = {r["Name"]: r for _, r in staff_df.iterrows()}
+    hmap = {r["Name"]: r for _, r in hours_df.iterrows()}
+    return staff_by_name, hmap
+
+def is_working(hmap, week_start, d, t, name):
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    dname = days[(d - week_start).days]
+    hr = hmap.get(name)
+    if hr is None:
+        return False
+    stt = hr.get(f"{dname}Start")
+    end = hr.get(f"{dname}End")
+    return bool(stt and end and (t >= stt) and (t < end))
+
+def shift_window(hmap, week_start, d, name):
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    dname = days[(d - week_start).days]
+    hr = hmap.get(name)
+    if hr is None:
+        return None, None
+    return hr.get(f"{dname}Start"), hr.get(f"{dname}End")
+
+def pick_break_slot_near_midpoint(d: date, stt: time, end: time):
+    if not stt or not end:
+        return None
+    if (dt_of(d, end) - dt_of(d, stt)).total_seconds() / 3600.0 <= BREAK_THRESHOLD_HOURS:
+        return None
+    midpoint = dt_of(d, stt) + (dt_of(d, end) - dt_of(d, stt)) / 2
+    candidates = []
+    for t in [time(12, 0), time(12, 30), time(13, 0), time(13, 30)]:
+        if t >= stt and add_minutes(t, 30) <= end and t_in_range(t, BREAK_WINDOW[0], BREAK_WINDOW[1]):
+            dist = abs((dt_of(d, t) - midpoint).total_seconds())
+            candidates.append((dist, t))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+# =========================================================
+# Block-based scheduler
+# =========================================================
+def rota_generate_week(staff_df, hours_df, hols, week_start: date):
+    slots = timeslots()
+    dates = [week_start + timedelta(days=i) for i in range(5)]
+    staff_by_name, hmap = build_maps(staff_df, hours_df)
+
+    # breaks: (d,t)->set(names)
+    breaks = {}
+    for d in dates:
+        for name in staff_by_name.keys():
+            if holiday_kind(name, d, hols):
+                continue
+            stt, end = shift_window(hmap, week_start, d, name)
+            b = pick_break_slot_near_midpoint(d, stt, end)
+            if b:
+                breaks.setdefault((d, b), set()).add(name)
+
+    # assignment map: (d,t,name)->role
+    a = {}
+
+    # track block for each (d,name): (role, site, end_idx_exclusive)
+    block = {}
+
+    # per-day role usage counts to avoid "same all day"
+    role_minutes = {}  # (d,name,role)->minutes
+
+    gaps = []
+
+    def on_break(name, d, t):
+        return name in breaks.get((d, t), set())
+
+    def is_free(name, d, t):
+        return (d, t, name) not in a
+
+    def slot_index(t):
+        return slots.index(t)
+
+    def has_role_at(role, d, t):
+        return [nm for (dd, tt, nm), rr in a.items() if dd == d and tt == t and rr == role]
+
+    def needed_for_slot(d, t):
+        wanted = []
+        for role, ta, tb, need in MANDATORY_RULES:
+            if t_in_range(t, ta, tb):
+                wanted.append((role, need))
+        if awaiting_required(d, t) or awaiting_optional(d, t):
+            wanted.append(("Awaiting_PSA_Admin", 1))
+        return wanted
+
+    def no_home_site_candidates(role, d, t):
+        # Determine if any staff on the target site (for site-bound roles) can cover at this time.
+        target_site = role_site(role, d)
+        for name, sr in staff_by_name.items():
+            if holiday_kind(name, d, hols):
+                continue
+            if not is_working(hmap, week_start, d, t, name):
+                continue
+            if on_break(name, d, t):
+                continue
+            if not is_free(name, d, t):
+                continue
+            if not skill_allowed(sr, role):
+                continue
+            # home-site only check
+            if target_site and str(sr.get("HomeSite","")).upper() != target_site:
+                continue
+            # for shared roles, treat "home-site" as their actual HomeSite (we don't force)
+            return False
+        return True
+
+    def candidate_ok(name, role, d, t, allow_cross):
+        sr = staff_by_name[name]
+
+        if holiday_kind(name, d, hols):
+            return False
+        if not is_working(hmap, week_start, d, t, name):
+            return False
+        if on_break(name, d, t):
+            return False
+        if not is_free(name, d, t):
+            return False
+        if not skill_allowed(sr, role):
+            return False
+
+        # existing block?
+        b = block.get((d, name))
+        if b is not None:
+            # if already in a block, must keep that role until block end
+            if b[0] != role:
+                return False
+
+        # cross-site only if no home-site candidates exist (and never for FrontDesk)
+        if not site_allowed(sr, role, d, allow_cross=allow_cross):
+            return False
+
+        # front desk must stay on their own site always
+        if is_frontdesk(role) and str(sr.get("HomeSite","")).upper() != role_site(role, d):
+            return False
+
+        return True
+
+    def pick_block_len(name, role, d, start_idx):
+        """Choose a block length in slots: >= MIN_BLOCK_SLOTS unless end-of-shift/break arrives sooner.
+           For non-email, cap at MAX_BLOCK_SLOTS. Prefer 3h early, 2h later, and avoid same all day."""
+        stt, end = shift_window(hmap, week_start, d, name)
+        if not stt or not end:
+            return 1
+        # latest index we can work
+        end_idx = start_idx
+        while end_idx < len(slots) and slots[end_idx] < end:
+            end_idx += 1
+
+        # if break within next N slots, cap to that
+        break_idx = None
+        for k in range(start_idx, min(len(slots), end_idx)):
+            if name in breaks.get((d, slots[k]), set()):
+                break_idx = k
+                break
+        hard_end = break_idx if break_idx is not None else end_idx
+
+        remaining = hard_end - start_idx
+        if remaining <= 0:
+            return 0
+
+        # end-of-shift remainder can be < MIN
+        if remaining < MIN_BLOCK_SLOTS:
+            return remaining
+
+        # avoid "same all day" by limiting repeats:
+        used_mins = role_minutes.get((d, name, role), 0)
+        # if already did >= 6h of this role, force 2h blocks from now (except email)
+        if role != "Email_Box" and used_mins >= 360:
+            return MIN_BLOCK_SLOTS
+
+        # prefer 3h blocks if it fits and not near end
+        if role == "Email_Box":
+            # Email: can be longer, but still don’t force all day; cap to 4h blocks for gentler rotation
+            return min(8, remaining)  # 4h max for email blocks here
+        return min(MAX_BLOCK_SLOTS, remaining)
+
+    def start_block(name, role, d, start_idx):
+        L = pick_block_len(name, role, d, start_idx)
+        if L <= 0:
+            return False
+        s = role_site(role, d) or str(staff_by_name[name].get("HomeSite","")).upper()
+        block[(d, name)] = (role, s, start_idx + L)
+        return True
+
+    def fill_block(name, d, idx):
+        """If staff has an active block, apply its role to this slot."""
+        b = block.get((d, name))
+        if not b:
+            return False
+        role, _, end_idx = b
+        if idx >= end_idx:
+            del block[(d, name)]
+            return False
+        t = slots[idx]
+        a[(d, t, name)] = role
+        role_minutes[(d, name, role)] = role_minutes.get((d, name, role), 0) + SLOT_MIN
+        return True
+
+    def enforce_frontdesk_exactly_one(d, idx):
+        t = slots[idx]
+        for site in ["SLGP", "JEN", "BGS"]:
+            role = f"FrontDesk_{site}"
+            current = has_role_at(role, d, t)
+            if len(current) > 1:
+                # should never happen; mark gaps and keep first
+                gaps.append((d, t, role, f"More than 1 assigned ({', '.join(current)})"))
+                for extra in current[1:]:
+                    a[(d, t, extra)] = "Unassigned"
+            if len(current) == 1:
+                continue
+            # need exactly 1
+            # candidate search: first within home site; no cross-site permitted for FD
+            cands = []
+            for name, sr in staff_by_name.items():
+                if str(sr.get("HomeSite","")).upper() != site:
+                    continue
+                if candidate_ok(name, role, d, t, allow_cross=False):
+                    cands.append(name)
+            # prefer Carol Church if applicable
+            if "Carol Church" in cands:
+                pick = "Carol Church"
+            elif cands:
+                pick = cands[0]
+            else:
+                gaps.append((d, t, role, "No suitable staff available"))
+                continue
+            if (d, pick) not in block:
+                start_block(pick, role, d, idx)
+            fill_block(pick, d, idx)
+
+    def enforce_role_need(role, need, d, idx):
+        t = slots[idx]
+        current = has_role_at(role, d, t)
+        while len(current) < need:
+            # decide whether cross-site is allowed
+            allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
+            # candidate pool
+            cands = []
+            for name in staff_by_name.keys():
+                if candidate_ok(name, role, d, t, allow_cross=allow_cross):
+                    # site-sticky: prefer same site blocks
+                    prev_block = block.get((d, name))
+                    penalty = 0
+                    if prev_block:
+                        # if they are blocked to other role, they won't be candidate_ok anyway
+                        penalty = 0
+                    # deprioritise if they've already done lots of this role today
+                    used_mins = role_minutes.get((d, name, role), 0)
+                    penalty += used_mins / 60.0
+                    penalty -= 0.75 * (skill_weight(sr, role) - 3)
+                    cands.append((penalty, name))
+            if not cands:
+                if role != "Awaiting_PSA_Admin" or awaiting_required(d, t):
+                    gaps.append((d, t, role, "No suitable staff available"))
+                break
+            cands.sort(key=lambda x: x[0])
+            pick = cands[0][1]
+            if (d, pick) not in block:
+                start_block(pick, role, d, idx)
+            fill_block(pick, d, idx)
+            current = has_role_at(role, d, t)
+
+    # main loop: per day, per slot
+    for d in dates:
+        for idx in range(len(slots)):
+            t = slots[idx]
+
+            # 1) extend existing blocks into this slot
+            for name in staff_by_name.keys():
+                # don't overwrite break/holiday; blocks won't exist if not working
+                if (d, t, name) in a:
+                    continue
+                fill_block(name, d, idx)
+
+            # 2) Enforce Front Desk exactly one per site
+            enforce_frontdesk_exactly_one(d, idx)
+
+            # 3) Enforce other mandatory coverage
+            wanted = needed_for_slot(d, t)
+            for role, need in wanted:
+                if role.startswith("FrontDesk_"):
+                    # already handled above as exact 1, but ensure need=1 coverage
+                    continue
+                enforce_role_need(role, need, d, idx)
+
+            # 4) Fill everyone who is working and not on break and not assigned yet
+            filler_roles = filler_order_for_day(d)
+            for name, sr in staff_by_name.items():
+                if holiday_kind(name, d, hols):
+                    continue
+                if not is_working(hmap, week_start, d, t, name):
+                    continue
+                if on_break(name, d, t):
+                    continue
+                if not is_free(name, d, t):
+                    continue
+
+                # if they have a continuing block, it would have filled already; so start a new filler block
+                chosen = None
+
+                # SLGP majority on bookings: if SLGP and bookings trained, prefer bookings
+                if str(sr.get("HomeSite","")).upper() == "SLGP" and skill_allowed(sr, "Bookings"):
+                    if site_allowed(sr, "Bookings", d, allow_cross=False) and skill_allowed(sr, "Bookings"):
+                        chosen = "Bookings"
+
+                if not chosen:
+                    # prefer NOT repeating same role all day: pick role with least minutes so far today
+                    best = None
+                    for role in filler_roles:
+                        if role == "Awaiting_PSA_Admin" and not awaiting_optional(d, t):
+                            continue
+                        if not skill_allowed(sr, role):
+                            continue
+                        allow_cross = (not is_frontdesk(role)) and no_home_site_candidates(role, d, t)
+                        if not site_allowed(sr, role, d, allow_cross=allow_cross):
+                            continue
+                        # avoid ultra-long same-role days (except email): if already >= 6h on this role, deprioritise
+                        used = role_minutes.get((d, name, role), 0)
+                        if role != "Email_Box" and used >= 360:
+                            continue
+                        wgt = skill_weight(sr, role)
+                        score = used - (wgt - 3) * 30
+                        if best is None or score < best[0]:
+                            best = (score, role)
+                    if best:
+                        chosen = best[1]
+
+                if not chosen:
+                    chosen = "Unassigned"
+
+                if (d, name) not in block:
+                    start_block(name, chosen, d, idx)
+                fill_block(name, d, idx)
+
+    # verify break placement if >6h
+    for d in dates:
+        for name in staff_by_name.keys():
+            if holiday_kind(name, d, hols):
+                continue
+            stt, end = shift_window(hmap, week_start, d, name)
+            if not stt or not end:
+                continue
+            if (dt_of(d, end) - dt_of(d, stt)).total_seconds() / 3600.0 <= BREAK_THRESHOLD_HOURS:
+                continue
+            had_break = any(name in breaks.get((d, bt), set()) for bt in [time(12,0), time(12,30), time(13,0), time(13,30)])
+            if not had_break:
+                gaps.append((d, None, "Break", f"{name}: shift > 6h but no break could be placed 12:00–14:00"))
+
+    return a, breaks, gaps, hmap
+
+# =========================================================
+# Excel output
+# =========================================================
 ROLE_COLORS = {
+    # roles
     "FrontDesk_SLGP": "FFF2CC",
     "FrontDesk_JEN":  "FFF2CC",
     "FrontDesk_BGS":  "FFF2CC",
@@ -219,634 +705,268 @@ ROLE_COLORS = {
     "Email_Box": "CFE2F3",
     "Phones": "C9DAF8",
     "Bookings": "FCE5CD",
-    "EMIS": "EAD1DC",
-    "Docman_PSA": "D0E0E3",
-    "Docman_Awaiting": "D0E0E3",
-    "Break": "E6E6E6",
+    "Emis_Tasks": "EAD1DC",
+    "Docman_Tasks": "D0E0E3",
+    "Awaiting_PSA_Admin": "D0E0E3",
     "Unassigned": "FFFFFF",
+    # statuses
+    "Break": "CFE2F3",
+    "Not working": "DDDDDD",
+    "Holiday": "FFF2CC",
+    "Bank Holiday": "FFE599",
+    "Sick": "F4CCCC",
+    "": "DDDDDD",
 }
 
-MANDATORY = [
-    # all day front desks
-    ("FrontDesk_SLGP", time(8,0), time(18,30), 1),
-    ("FrontDesk_JEN",  time(8,0), time(18,30), 1),
-    ("FrontDesk_BGS",  time(8,0), time(18,30), 1),
+def fill_for(value: str):
+    return PatternFill("solid", fgColor=ROLE_COLORS.get(value, "FFFFFF"))
 
-    # triage at JEN + SLGP until 16:00
-    ("Triage_Admin_SLGP", time(8,0), time(16,0), 1),
-    ("Triage_Admin_JEN",  time(8,0), time(16,0), 1),
-
-    # email always by JEN/BGS
-    ("Email_Box", time(8,0), time(18,30), 1),
-
-    # phones 2–3 by JEN/BGS (min 2 enforced; we allow 3 if spare)
-    ("Phones", time(8,0), time(18,30), 2),
-]
-
-FILLER = [
-    ("Bookings", time(8,0), time(18,30), None),         # SLGP majority
-    ("EMIS", time(8,0), time(18,30), None),             # JEN/BGS
-    ("Docman_PSA", time(8,0), time(18,30), None),       # JEN/BGS
-    ("Docman_Awaiting", time(8,0), time(18,30), None),  # JEN/BGS
-]
-
-def daterange(d0, d1):
-    d = d0
-    while d <= d1:
-        yield d
-        d += timedelta(days=1)
-
-def is_on_holiday(name, d, hols):
-    for n, s, e in hols:
-        if n.strip().lower() == name.strip().lower() and s and e and s <= d <= e:
-            return True
-    return False
-
-def timeslots(day_start=time(8,0), day_end=time(18,30), step_min=30):
-    start_dt = datetime(2000,1,1, day_start.hour, day_start.minute)
-    end_dt = datetime(2000,1,1, day_end.hour, day_end.minute)
-    cur = start_dt
-    out = []
-    while cur < end_dt:
-        out.append(cur.time())
-        cur += timedelta(minutes=step_min)
-    return out
-
-def t_in_range(t, a, b):
-    return (t >= a) and (t < b)
-
-def hours_between(t1, t2):
-    dt1 = datetime(2000,1,1,t1.hour,t1.minute)
-    dt2 = datetime(2000,1,1,t2.hour,t2.minute)
-    return (dt2 - dt1).total_seconds() / 3600
-
-def skill_allowed(staff_row, role):
-    # map role -> skill column name possibilities
-    role_map = {
-        "FrontDesk": ["FrontDesk", "Front Desk", "Reception"],
-        "Triage": ["Triage", "AdminTriage", "Admin Triage"],
-        "Email_Box": ["Email", "EmailBox", "Emails", "Email Box"],
-        "Phones": ["Phones", "Phone"],
-        "Bookings": ["Bookings", "Booking"],
-        "EMIS": ["EMIS"],
-        "Docman_PSA": ["DocmanPSA", "Docman PSA", "PSA"],
-        "Docman_Awaiting": ["DocmanAwaiting", "AwaitingResponse", "Awaiting Response"],
-    }
-
-    if role.startswith("FrontDesk"):
-        keys = role_map["FrontDesk"]
-    elif role.startswith("Triage_Admin"):
-        keys = role_map["Triage"]
-    else:
-        keys = role_map.get(role, [role])
-
-    cols = {normalize(c): c for c in staff_row.index}
-    for k in keys:
-        nk = normalize(k)
-        if nk in cols:
-            return bool(staff_row[cols[nk]])
-    # if skill column missing, default to False (safer)
-    return False
-
-def site_restriction_ok(staff_row, role):
-    home = str(staff_row.get("HomeSite","")).strip().upper()
-    # Email + Phones only JEN/BGS
-    if role in ["Email_Box", "Phones", "EMIS", "Docman_PSA", "Docman_Awaiting"]:
-        return home in ["JEN", "BGS"]
-    # Bookings mainly SLGP (allow SLGP only here)
-    if role == "Bookings":
-        return home == "SLGP"
-    # site-specific roles
-    if role.endswith("_SLGP"):
-        return home == "SLGP"
-    if role.endswith("_JEN"):
-        return home == "JEN"
-    if role.endswith("_BGS"):
-        return home == "BGS"
-    return True
-
-def build_availability(staff_df, hours_df, hols, week_start: date):
-    # returns dict day-> list of available staff names
-    hmap = {r["Name"]: r for _, r in hours_df.iterrows()}
-
-    days = ["Mon","Tue","Wed","Thu","Fri"]
-    out = {}
-    for i, dname in enumerate(days):
-        d = week_start + timedelta(days=i)
-        available = []
-        for _, s in staff_df.iterrows():
-            name = s["Name"]
-            if is_on_holiday(name, d, hols):
-                continue
-            hr = hmap.get(name)
-            if hr is None:
-                continue
-            stt = hr.get(f"{dname}Start")
-            end = hr.get(f"{dname}End")
-            if stt and end:
-                available.append(name)
-        out[d] = available
-    return out, hmap
-
-def staff_work_window(hmap_row, dname):
-    stt = hmap_row.get(f"{dname}Start")
-    end = hmap_row.get(f"{dname}End")
-    return stt, end
-
-def rota_generate_one_week(
-    staff_df, hours_df, hols, week_start: date,
-    phones_max=3,
-    break_window=(time(11,30), time(14,0)),
-    max_frontdesk_block_hours=2.5,
-    max_triage_block_hours=3.0,
-    fairness_state=None,
-):
-    """
-    fairness_state: dict tracking cumulative penalties/hours across weeks, optional.
-    """
-    if fairness_state is None:
-        fairness_state = {
-            "role_hours": {},      # (name, role)->hours
-            "frontdesk_hours": {}, # name->hours
-            "triage_hours": {},    # name->hours
-        }
-
-    slots = timeslots()
-    days = ["Mon","Tue","Wed","Thu","Fri"]
-
-    availability, hmap = build_availability(staff_df, hours_df, hols, week_start)
-    staff_by_name = {r["Name"]: r for _, r in staff_df.iterrows()}
-
-    # assignments: dict[(date, time)] -> dict role -> staffname
-    assign = {}
-    gaps = []
-
-    # track consecutive blocks per staff per role-group (front desk / triage)
-    frontdesk_block = {} # (date, staff)->consecutive hours
-    triage_block = {}    # (date, staff)->consecutive hours
-
-    # track total assigned hours per day per staff and whether break placed
-    day_hours = {}       # (date, staff)->hours
-    break_done = {}      # (date, staff)->bool
-
-    def can_work(name, d, t):
-        hr = hmap.get(name)
-        if hr is None:
-            return False
-        dname = days[(d - week_start).days]
-        stt, end = staff_work_window(hr, dname)
-        return stt and end and (t >= stt) and (t < end)
-
-    def score_candidate(name, role):
-        # lower is better
-        key = (name, role)
-        base = fairness_state["role_hours"].get(key, 0.0)
-        # penalize overuse of front desk & triage in general
-        if role.startswith("FrontDesk"):
-            base += 2.0 * fairness_state["frontdesk_hours"].get(name, 0.0)
-        if role.startswith("Triage_Admin"):
-            base += 1.5 * fairness_state["triage_hours"].get(name, 0.0)
-        return base
-
-    def pick_staff(d, t, role, already_used_set):
-        # enforce Carol rule: if Carol working, always front desk at her site
-        if role.startswith("FrontDesk"):
-            for _, sr in staff_df.iterrows():
-                if sr.get("IsCarolChurch", False) and can_work(sr["Name"], d, t):
-                    # Carol must be on front desk "when she is in"
-                    # Only if the role matches her home site
-                    home = str(sr.get("HomeSite","")).upper()
-                    if role.endswith(home):
-                        return sr["Name"]
-
-        candidates = []
-        for name in availability.get(d, []):
-            if name in already_used_set:
-                continue
-            if not can_work(name, d, t):
-                continue
-            sr = staff_by_name[name]
-            if not site_restriction_ok(sr, role):
-                continue
-            # skills
-            if role.startswith("FrontDesk"):
-                if not skill_allowed(sr, "FrontDesk"):
-                    continue
-                # block limit
-                cur = frontdesk_block.get((d, name), 0.0)
-                if cur + 0.5 > max_frontdesk_block_hours:
-                    continue
-            elif role.startswith("Triage_Admin"):
-                if not skill_allowed(sr, "Triage"):
-                    continue
-                cur = triage_block.get((d, name), 0.0)
-                if cur + 0.5 > max_triage_block_hours:
-                    continue
-            else:
-                if not skill_allowed(sr, role):
-                    continue
-
-            candidates.append(name)
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda n: (score_candidate(n, role), day_hours.get((d,n), 0.0)))
-        return candidates[0]
-
-    # schedule breaks: if staff has >6 hours that day, force one 30-min slot in window
-    def maybe_force_breaks(d, t):
-        bw0, bw1 = break_window
-        if not t_in_range(t, bw0, bw1):
-            return
-        for name in availability.get(d, []):
-            if not can_work(name, d, t):
-                continue
-            if break_done.get((d, name), False):
-                continue
-            # only force once we already know they are likely to exceed 6 hours:
-            # heuristic: if their shift length > 6 hours, require break
-            hr = hmap[name]
-            dname = days[(d - week_start).days]
-            stt, end = staff_work_window(hr, dname)
-            if not stt or not end:
-                continue
-            shift_len = hours_between(stt, end)
-            if shift_len <= 6:
-                continue
-
-            # if person is currently assigned to something in this slot, skip forcing
-            slot_roles = assign.get((d, t), {})
-            if name in slot_roles.values():
-                continue
-
-            # mark break
-            assign.setdefault((d, t), {})
-            # allow multiple breaks in same slot for different staff using longform output later
-            # For grid, we'll record breaks in longform and totals; grid remains role-based coverage.
-            break_done[(d, name)] = True
-
-    # Fill mandatory roles each slot
-    for d in sorted(availability.keys()):
-        for t in slots:
-            maybe_force_breaks(d, t)
-            used = set()
-            slot_roles = assign.setdefault((d, t), {})
-
-            # mandatory roles
-            for role, r0, r1, need in MANDATORY:
-                if not t_in_range(t, r0, r1):
-                    continue
-
-                # Phones: we enforce min=2; later optionally add 3rd if spare
-                if role == "Phones":
-                    for k in range(need):
-                        pick = pick_staff(d, t, role, used)
-                        if pick:
-                            slot_roles[f"Phones_{k+1}"] = pick
-                            used.add(pick)
-                            day_hours[(d, pick)] = day_hours.get((d, pick), 0.0) + 0.5
-                        else:
-                            gaps.append((d, t, "Phones", "No available JEN/BGS phone-trained staff"))
-                    # try add a 3rd phone if spare capacity and phones_max==3
-                    if phones_max >= 3:
-                        pick = pick_staff(d, t, role, used)
-                        if pick:
-                            slot_roles["Phones_3"] = pick
-                            used.add(pick)
-                            day_hours[(d, pick)] = day_hours.get((d, pick), 0.0) + 0.5
-                    continue
-
-                # normal mandatory single coverage
-                pick = pick_staff(d, t, role, used)
-                if pick:
-                    slot_roles[role] = pick
-                    used.add(pick)
-                    day_hours[(d, pick)] = day_hours.get((d, pick), 0.0) + 0.5
-
-                    # update blocks
-                    if role.startswith("FrontDesk"):
-                        frontdesk_block[(d, pick)] = frontdesk_block.get((d, pick), 0.0) + 0.5
-                    else:
-                        # reset if not on front desk this slot
-                        for n in list(frontdesk_block.keys()):
-                            dd, nm = n
-                            if dd == d and nm == pick:
-                                pass
-                    if role.startswith("Triage_Admin"):
-                        triage_block[(d, pick)] = triage_block.get((d, pick), 0.0) + 0.5
-                else:
-                    gaps.append((d, t, role, "No suitable staff available"))
-
-            # reset blocks for staff not currently on that role (simple approximation)
-            # (prevents blocks carrying over incorrectly)
-            fd_names = {v for k, v in slot_roles.items() if k.startswith("FrontDesk")}
-            tr_names = {v for k, v in slot_roles.items() if k.startswith("Triage_Admin")}
-            for name in availability.get(d, []):
-                if name not in fd_names:
-                    frontdesk_block[(d, name)] = 0.0
-                if name not in tr_names:
-                    triage_block[(d, name)] = 0.0
-
-    # Filler tasks: assign remaining working time that isn’t already used
-    # We do this in longform output rather than overloading the grid with unlimited roles.
-    # We'll calculate "unassigned capacity" per staff per day and allocate to tasks by policy.
-    filler_alloc = []  # rows: date, name, role, hours
-    for i, dname in enumerate(days):
-        d = week_start + timedelta(days=i)
-        for name in availability.get(d, []):
-            hr = hmap[name]
-            stt, end = staff_work_window(hr, dname)
-            if not stt or not end:
-                continue
-            shift_len = hours_between(stt, end)
-            already = day_hours.get((d, name), 0.0)
-            # subtract break (0.5h) if needed and break was scheduled
-            if shift_len > 6:
-                if break_done.get((d, name), False):
-                    already += 0.5
-                else:
-                    # if no break could be placed, record gap
-                    gaps.append((d, None, "Break", f"{name} shift > 6h but no break placed in 11:30–14:00"))
-            remaining = max(0.0, shift_len - already)
-
-            if remaining <= 0:
-                continue
-
-            # task policy:
-            # SLGP -> Bookings majority; JEN/BGS -> EMIS + Docman
-            home = str(staff_by_name[name].get("HomeSite","")).upper()
-            if home == "SLGP" and skill_allowed(staff_by_name[name], "Bookings"):
-                filler_alloc.append((d, name, "Bookings", remaining))
-            elif home in ["JEN", "BGS"]:
-                # split between EMIS and Docman if trained
-                parts = []
-                if skill_allowed(staff_by_name[name], "EMIS"):
-                    parts.append("EMIS")
-                if skill_allowed(staff_by_name[name], "Docman_PSA"):
-                    parts.append("Docman_PSA")
-                if skill_allowed(staff_by_name[name], "Docman_Awaiting"):
-                    parts.append("Docman_Awaiting")
-
-                if not parts:
-                    filler_alloc.append((d, name, "Unassigned", remaining))
-                else:
-                    per = remaining / len(parts)
-                    for r in parts:
-                        filler_alloc.append((d, name, r, per))
-            else:
-                filler_alloc.append((d, name, "Unassigned", remaining))
-
-    # Update fairness_state (so next week balances better)
-    # We count the mandatory grid roles by slot + filler allocations
-    for (d, t), slot_roles in assign.items():
-        for role_key, name in slot_roles.items():
-            role = role_key if not role_key.startswith("Phones_") else "Phones"
-            fairness_state["role_hours"][(name, role)] = fairness_state["role_hours"].get((name, role), 0.0) + 0.5
-            if role.startswith("FrontDesk"):
-                fairness_state["frontdesk_hours"][name] = fairness_state["frontdesk_hours"].get(name, 0.0) + 0.5
-            if role.startswith("Triage_Admin"):
-                fairness_state["triage_hours"][name] = fairness_state["triage_hours"].get(name, 0.0) + 0.5
-
-    for d, name, role, hrs in filler_alloc:
-        fairness_state["role_hours"][(name, role)] = fairness_state["role_hours"].get((name, role), 0.0) + float(hrs)
-
-    return assign, filler_alloc, gaps, fairness_state
-
-
-# -----------------------------
-# Excel Output
-# -----------------------------
-def fill_for_role(role):
-    col = ROLE_COLORS.get(role, "FFFFFF")
-    return PatternFill("solid", fgColor=col)
-
-def write_week_to_workbook(wb: Workbook, title: str, week_start: date, assign, filler_alloc, gaps):
-    ws_grid = wb.create_sheet(f"{title}_Grid")
-    ws_gap = wb.create_sheet(f"{title}_CoverageGaps")
-    ws_tot = wb.create_sheet(f"{title}_Totals")
-
-    slots = timeslots()
-    days = ["Mon","Tue","Wed","Thu","Fri"]
-    dates = [week_start + timedelta(days=i) for i in range(5)]
-
-    # --- GRID ---
-    # Columns: Time, then each day
-    ws_grid.append(["Time"] + [d.strftime("%a %d-%b") for d in dates])
-    for cell in ws_grid[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # For each slot, we put a compact string summarizing coverage
-    # (Front desks, triage, email, phones)
-    for t in slots:
-        row = [t.strftime("%H:%M")]
-        for d in dates:
-            slot_roles = assign.get((d, t), {})
-            # build readable summary
-            parts = []
-            for k in ["FrontDesk_SLGP","FrontDesk_JEN","FrontDesk_BGS","Triage_Admin_SLGP","Triage_Admin_JEN","Email_Box"]:
-                if k in slot_roles:
-                    parts.append(f"{k}:{slot_roles[k]}")
-            phones = [slot_roles.get("Phones_1"), slot_roles.get("Phones_2"), slot_roles.get("Phones_3")]
-            phones = [p for p in phones if p]
-            if phones:
-                parts.append("Phones:" + ", ".join(phones))
-
-            txt = "\n".join(parts) if parts else ""
-            row.append(txt)
-        ws_grid.append(row)
-
-    # style grid
-    ws_grid.column_dimensions["A"].width = 8
-    for col in range(2, 7):
-        ws_grid.column_dimensions[chr(64+col)].width = 32
-    for r in range(2, 2+len(slots)):
-        ws_grid.row_dimensions[r].height = 60
-        for c in range(2, 7):
-            ws_grid.cell(r, c).alignment = Alignment(wrap_text=True, vertical="top")
-
-    # --- COVERAGE GAPS ---
-    ws_gap.append(["Date", "Time", "Role", "Issue"])
-    ws_gap[1][0].font = ws_gap[1][1].font = ws_gap[1][2].font = ws_gap[1][3].font = Font(bold=True)
-
-    for d, t, role, issue in gaps:
-        t_str = "" if t is None else t.strftime("%H:%M")
-        ws_gap.append([d.isoformat(), t_str, role, issue])
-
-    # --- TOTALS ---
-    # Daily & weekly totals per staff by task + weekly hours per site
-    # Build longform from mandatory grid + filler_alloc
-    rows = []
-    for (d, t), slot_roles in assign.items():
-        for role_key, name in slot_roles.items():
-            role = "Phones" if role_key.startswith("Phones_") else role_key
-            rows.append([d, name, role, 0.5])
-    for d, name, role, hrs in filler_alloc:
-        rows.append([d, name, role, float(hrs)])
-
-    df = pd.DataFrame(rows, columns=["Date","Name","Role","Hours"])
-    if df.empty:
-        df = pd.DataFrame(columns=["Date","Name","Role","Hours"])
-
-    # Staff weekly totals
-    pivot_week = (df.groupby(["Name","Role"])["Hours"].sum()
-                    .reset_index()
-                    .pivot(index="Name", columns="Role", values="Hours")
-                    .fillna(0.0))
-    pivot_week["WeeklyTotal"] = pivot_week.sum(axis=1)
-    pivot_week = pivot_week.reset_index()
-
-    # Daily totals
-    pivot_day = (df.groupby(["Date","Name","Role"])["Hours"].sum()
-                  .reset_index())
-
-    # Weekly hours totals per site (approx: infer from role name suffix or staff home site not included here,
-    # so we estimate by role: FrontDesk_SITE and Triage_SITE as site hours; other tasks as staff home site unknown in this tab)
-    site_hours = []
-    for role in ["FrontDesk_SLGP","FrontDesk_JEN","FrontDesk_BGS","Triage_Admin_SLGP","Triage_Admin_JEN"]:
-        hrs = df.loc[df["Role"]==role, "Hours"].sum()
-        if role.endswith("_SLGP"): site="SLGP"
-        elif role.endswith("_JEN"): site="JEN"
-        else: site="BGS"
-        site_hours.append([site, role, float(hrs)])
-    site_df = pd.DataFrame(site_hours, columns=["Site","Role","Hours"])
-    site_sum = site_df.groupby("Site")["Hours"].sum().reset_index().rename(columns={"Hours":"WeeklyHoursTotal"})
-
-    # Write totals sheet
-    ws_tot.append(["Weekly totals per staff by task (hours)"])
-    ws_tot["A1"].font = Font(bold=True, size=12)
-
-    start_row = 3
-    for r in dataframe_to_rows(pivot_week, index=False, header=True):
-        ws_tot.append(r)
-
-    # format header row
-    header_row = start_row
-    for cell in ws_tot[header_row]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # colour-code columns by role
-    # header row is at row=3
-    headers = [c.value for c in ws_tot[header_row]]
-    for j, h in enumerate(headers, start=1):
-        if not h or h == "Name": 
-            continue
-        fill = fill_for_role(h)
-        for i in range(header_row, header_row + len(pivot_week) + 1):
-            ws_tot.cell(i, j).fill = fill
-
-    # daily totals block
-    ws_tot.append([])
-    ws_tot.append(["Daily totals per staff by task"])
-    ws_tot[f"A{ws_tot.max_row}"].font = Font(bold=True, size=12)
-
-    for r in dataframe_to_rows(pivot_day, index=False, header=True):
-        ws_tot.append(r)
-
-    # site summary block
-    ws_tot.append([])
-    ws_tot.append(["Weekly hours totals per site (coverage roles)"])
-    ws_tot[f"A{ws_tot.max_row}"].font = Font(bold=True, size=12)
-
-    for r in dataframe_to_rows(site_sum, index=False, header=True):
-        ws_tot.append(r)
-
-    return wb
-
-
-def build_excel_for_period(staff_df, hours_df, hols, start_monday: date, weeks: int, phones_max=3):
+def build_workbook(staff_df, hours_df, hols, start_monday: date, weeks: int):
     wb = Workbook()
-    # remove default sheet
     wb.remove(wb.active)
+    slots = timeslots()
 
-    fairness_state = None
-    all_gap_rows = []
     for w in range(weeks):
-        ws = start_monday + timedelta(days=7*w)
-        assign, filler_alloc, gaps, fairness_state = rota_generate_one_week(
-            staff_df, hours_df, hols,
-            week_start=ws,
-            phones_max=phones_max,
-            fairness_state=fairness_state
-        )
-        title = f"Week{w+1}_{ws.strftime('%d%b')}"
-        write_week_to_workbook(wb, title, ws, assign, filler_alloc, gaps)
-        all_gap_rows.extend([(ws,)+g for g in gaps])
+        week_start = start_monday + timedelta(days=7*w)
+        dates = [week_start + timedelta(days=i) for i in range(5)]
+        staff_names = list(staff_df["Name"].astype(str))
+
+        a, breaks, gaps, hmap = rota_generate_week(staff_df, hours_df, hols, week_start)
+
+        # Week grid
+        ws_grid = wb.create_sheet(f"Week{w+1}_Grid")
+        ws_grid.append(["Time"] + [d.strftime("%a %d-%b") for d in dates])
+        for c in ws_grid[1]:
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
+        for t in slots:
+            row = [t.strftime("%H:%M")]
+            for d in dates:
+                parts = []
+                for role in [
+                    "FrontDesk_SLGP","FrontDesk_JEN","FrontDesk_BGS",
+                    "Triage_Admin_SLGP","Triage_Admin_JEN",
+                    "Email_Box","Phones","Bookings",
+                    "Awaiting_PSA_Admin","Emis_Tasks","Docman_Tasks",
+                ]:
+                    ppl = [nm for nm in staff_names if a.get((d, t, nm)) == role]
+                    if ppl:
+                        parts.append(f"{role}: " + ", ".join(ppl))
+                row.append("\n".join(parts))
+            ws_grid.append(row)
+
+        ws_grid.column_dimensions["A"].width = 8
+        for col in range(2, 7):
+            ws_grid.column_dimensions[chr(64+col)].width = 42
+        for r in range(2, 2+len(slots)):
+            ws_grid.row_dimensions[r].height = 95
+            for c in range(2, 7):
+                ws_grid.cell(r, c).alignment = Alignment(wrap_text=True, vertical="top")
+
+        # Coverage gaps
+        ws_gaps = wb.create_sheet(f"Week{w+1}_CoverageGaps")
+        ws_gaps.append(["Date", "Time", "Role", "Issue"])
+        for c in ws_gaps[1]:
+            c.font = Font(bold=True)
+        for d, t, role, issue in gaps:
+            ws_gaps.append([d.isoformat(), "" if t is None else t.strftime("%H:%M"), role, issue])
+
+        # Totals
+        ws_tot = wb.create_sheet(f"Week{w+1}_Totals")
+        rows = []
+        for d in dates:
+            for t in slots:
+                for nm in staff_names:
+                    role = a.get((d, t, nm))
+                    if role:
+                        rows.append([d, nm, role, 0.5])
+                for nm in breaks.get((d, t), set()):
+                    rows.append([d, nm, "Break", 0.5])
+        df = pd.DataFrame(rows, columns=["Date","Name","Task","Hours"])
+        if df.empty:
+            df = pd.DataFrame(columns=["Date","Name","Task","Hours"])
+
+        pivot_w = (df.groupby(["Name","Task"])["Hours"].sum()
+                     .reset_index()
+                     .pivot(index="Name", columns="Task", values="Hours")
+                     .fillna(0.0))
+        pivot_w["WeeklyTotal"] = pivot_w.sum(axis=1)
+        pivot_w = pivot_w.reset_index()
+
+        pivot_d = df.groupby(["Date","Name","Task"])["Hours"].sum().reset_index()
+
+        ws_tot.append(["Weekly totals per staff by task (hours)"])
+        ws_tot["A1"].font = Font(bold=True, size=12)
+        ws_tot.append([])
+        for r in dataframe_to_rows(pivot_w, index=False, header=True):
+            ws_tot.append(r)
+
+        header_row = 3
+        for cell in ws_tot[header_row]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        headers = [c.value for c in ws_tot[header_row]]
+        for j, h in enumerate(headers, start=1):
+            if not h or h == "Name":
+                continue
+            f = fill_for(h)
+            for irow in range(header_row, header_row + len(pivot_w) + 1):
+                ws_tot.cell(irow, j).fill = f
+
+        ws_tot.append([])
+        ws_tot.append(["Daily totals per staff by task (hours)"])
+        ws_tot[f"A{ws_tot.max_row}"].font = Font(bold=True, size=12)
+        ws_tot.append([])
+        for r in dataframe_to_rows(pivot_d, index=False, header=True):
+            ws_tot.append(r)
+
+        # Timelines
+        ws_tl = wb.create_sheet(f"Week{w+1}_Timelines_All")
+        ws_tl.append(["Date", "Time"] + staff_names)
+        for c in ws_tl[1]:
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_tl.freeze_panes = "C2"
+
+        for d in dates:
+            for t in slots:
+                row = [d.strftime("%a %d-%b"), t.strftime("%H:%M")]
+                for nm in staff_names:
+                    hk = holiday_kind(nm, d, hols)
+                    if hk:
+                        row.append(hk)
+                    elif not is_working(hmap, week_start, d, t, nm):
+                        row.append("")
+                    elif nm in breaks.get((d, t), set()):
+                        row.append("Break")
+                    else:
+                        row.append(a.get((d, t, nm), "Unassigned"))
+                ws_tl.append(row)
+
+        for r in range(2, ws_tl.max_row + 1):
+            for c in range(3, ws_tl.max_column + 1):
+                val = str(ws_tl.cell(r, c).value)
+                ws_tl.cell(r, c).fill = fill_for(val)
+                ws_tl.cell(r, c).alignment = Alignment(wrap_text=True, vertical="top")
+
+        # By site
+        for site in ["SLGP","JEN","BGS"]:
+            site_staff = list(staff_df.loc[staff_df["HomeSite"].astype(str).str.upper()==site, "Name"].astype(str))
+            if not site_staff:
+                continue
+            ws_site = wb.create_sheet(f"Week{w+1}_{site}_Timelines")
+            ws_site.append(["Date", "Time"] + site_staff)
+            for c in ws_site[1]:
+                c.font = Font(bold=True)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_site.freeze_panes = "C2"
+            for d in dates:
+                for t in slots:
+                    row = [d.strftime("%a %d-%b"), t.strftime("%H:%M")]
+                    for nm in site_staff:
+                        hk = holiday_kind(nm, d, hols)
+                        if hk:
+                            row.append(hk)
+                        elif not is_working(hmap, week_start, d, t, nm):
+                            row.append("")
+                        elif nm in breaks.get((d, t), set()):
+                            row.append("Break")
+                        else:
+                            row.append(a.get((d, t, nm), "Unassigned"))
+                    ws_site.append(row)
+            for r in range(2, ws_site.max_row + 1):
+                for c in range(3, ws_site.max_column + 1):
+                    val = str(ws_site.cell(r, c).value)
+                    ws_site.cell(r, c).fill = fill_for(val)
+                    ws_site.cell(r, c).alignment = Alignment(wrap_text=True, vertical="top")
 
     return wb
 
-
-# -----------------------------
+# =========================================================
 # Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Rota Generator", layout="wide")
+# =========================================================
+st.set_page_config(page_title="Rota Generator v10 (block engine)", layout="wide")
 require_password()
 
-st.title("Rota Generator (Excel export)")
+st.title("Rota Generator v10 — Block-based engine")
 
-with st.expander("Upload your completed template", expanded=True):
-    uploaded = st.file_uploader("Upload rota template (.xlsx)", type=["xlsx"])
-    col1, col2, col3 = st.columns(3)
+st.markdown("""
+### First time using this rota generator?
+1. Download the starter template below
+2. Fill in **Staff**, **WorkingHours**, and (optional) **Holidays**
+3. Optional: add task **weights (0–5)** per staff member to prefer stronger/faster people for specific tasks
+4. Upload the completed template and click **Generate**
 
-    with col1:
-        start_date = st.date_input("Week commencing (Monday)", value=date.today())
-    with col2:
-        mode = st.selectbox("Run period", ["1 week", "4 weeks (month)", "Custom # weeks"])
-    with col3:
-        phones_max = st.selectbox("Max phones if spare staff", [2, 3], index=1)
+**Optional weight columns (0–5):** FrontDeskWeight, TriageWeight, EmailWeight, PhonesWeight, BookingsWeight, EmisWeight, DocmanWeight, AwaitingWeight  
+Higher = preferred. Blank/missing = neutral.
+""")
 
-    if mode == "Custom # weeks":
-        weeks = st.number_input("Number of weeks", min_value=1, max_value=12, value=2, step=1)
-    elif mode == "4 weeks (month)":
-        weeks = 4
-    else:
-        weeks = 1
+# Starter template download (put rota_generator_template_v2.xlsx in repo root)
+tpl_bytes = None
+for p in ["rota_generator_template_v2.xlsx", "rota_generator_template.xlsx"]:
+    try:
+        with open(p, "rb") as f:
+            tpl_bytes = f.read()
+        break
+    except Exception:
+        pass
 
-def ensure_monday(d: date) -> date:
-    return d - timedelta(days=d.weekday())
+if tpl_bytes:
+    st.download_button(
+        "📥 Download starter template",
+        data=tpl_bytes,
+        file_name="rota_generator_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    st.info("Starter template not found. Add 'rota_generator_template_v2.xlsx' to your repo root to enable the download button.")
+
+
+uploaded = st.file_uploader("Upload rota template (.xlsx)", type=["xlsx"])
+
+c1, c2 = st.columns(2)
+with c1:
+    start_date = st.date_input("Week commencing (Monday)", value=date.today())
+with c2:
+    mode = st.selectbox("Run period", ["1 week", "4 weeks (month)", "Custom # weeks"])
+
+if mode == "Custom # weeks":
+    weeks = int(st.number_input("Number of weeks", min_value=1, max_value=12, value=2, step=1))
+elif mode == "4 weeks (month)":
+    weeks = 4
+else:
+    weeks = 1
+
+start_monday = ensure_monday(start_date)
+
+st.caption(
+    "v10: assigns tasks in 2h minimum blocks (unless end-of-shift/break), max 3h blocks (except Email). "
+    "Front Desk is exactly 1 per site at all times. Awaiting/PSA Admin mandatory 10:00–16:00 "
+    "(Mon/Fri SLGP, Tue/Thu JEN, Wed BGS). Holidays Notes: default Holiday unless includes 'sick/sickness' or 'bank'."
+)
 
 if uploaded:
     try:
-        staff_df, hours_df, hols, params, found_sheets = read_template(uploaded.getvalue())
-        st.success(f"Template loaded. Sheets found: {found_sheets}")
+        staff_df, hours_df, hols = read_template(uploaded.getvalue())
+        st.success("Template loaded.")
 
-        # show quick preview
-        with st.expander("Preview: Staff + Skills"):
-            st.dataframe(staff_df.head(50), use_container_width=True)
-        with st.expander("Preview: Working Hours"):
-            st.dataframe(hours_df.head(50), use_container_width=True)
-
-        start_monday = ensure_monday(start_date)
-        st.info(f"Generating from Monday: {start_monday.isoformat()} for {weeks} week(s).")
-
-        if st.button("Generate rota and export Excel"):
-            wb = build_excel_for_period(
-                staff_df=staff_df,
-                hours_df=hours_df,
-                hols=hols,
-                start_monday=start_monday,
-                weeks=int(weeks),
-                phones_max=int(phones_max),
-            )
-
+        if st.button("Generate rota and download Excel", type="primary"):
+            wb = build_workbook(staff_df, hours_df, hols, start_monday, weeks)
             bio = io.BytesIO()
             wb.save(bio)
             bio.seek(0)
-
             out_name = f"rota_{start_monday.isoformat()}_{weeks}w.xlsx"
             st.download_button(
                 "📊 Download Excel rota",
                 data=bio.getvalue(),
                 file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
-            st.success("Done — download the Excel file above.")
 
     except Exception as e:
         st.error("Could not process the template.")
         st.exception(e)
 else:
-    st.warning("Upload your completed template to continue.")
+    st.info("Upload your completed template to continue.")
